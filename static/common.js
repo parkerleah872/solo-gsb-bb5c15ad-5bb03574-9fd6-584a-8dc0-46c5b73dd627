@@ -9,7 +9,12 @@ async function api(path, options = {}) {
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(typeof data.detail === "string" ? data.detail : `请求失败 (${res.status})`);
+    const err = new Error(typeof data.detail === "string" ? data.detail : `请求失败 (${res.status})`);
+    // Keep the status and parsed body on the error: a 409 conflict response
+    // carries the latest session under `data.run` so callers can re-render.
+    err.status = res.status;
+    err.data = data;
+    throw err;
   }
   return data;
 }

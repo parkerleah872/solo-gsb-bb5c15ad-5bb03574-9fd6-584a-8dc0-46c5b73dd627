@@ -52,6 +52,14 @@ def init_db() -> None:
                 current_node_id TEXT,
                 steps           TEXT NOT NULL DEFAULT '[]',
                 finished        INTEGER NOT NULL DEFAULT 0,
+                -- Monotonic session revision, bumped on EVERY path change
+                -- (choice / undo / restart). A choice request carries the
+                -- revision the page was rendered with; the server compares
+                -- and swaps it inside one write transaction, so a stale or
+                -- parallel submission (repeated clicks, two tabs, an old
+                -- request from before an undo/restart) is rejected with 409
+                -- and can never overwrite a newer path.
+                revision        INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL
             );
 
@@ -131,6 +139,8 @@ def init_db() -> None:
              "ALTER TABLE shares ADD COLUMN open_deadline_at TEXT"),
             ("shares", "max_new_runs",
              "ALTER TABLE shares ADD COLUMN max_new_runs INTEGER"),
+            ("runs", "revision",
+             "ALTER TABLE runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"),
         ]
         for table, column, ddl in backfills:
             cols = {r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}

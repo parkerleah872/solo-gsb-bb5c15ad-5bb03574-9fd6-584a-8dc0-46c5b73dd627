@@ -114,6 +114,10 @@
 <script src="/static/common.js"></script>
 <script>
   let runId = null;
+  // Revision of the session as currently rendered; sent with every choice so
+  // the server can reject a stale request (409) instead of letting it overwrite
+  // a path that moved on (double clicks, a second tab, undo/restart).
+  let runRevision = 0;
   let inviteOnly = false;
   // Answer-open gate state for starting a NEW session (all times UTC):
   // open | not_started (未开放, start inclusive) | closed (已截止, deadline
@@ -236,6 +240,7 @@
 
   function renderRun(r, resumedInfo) {
     const node = r.current_node;
+    if (typeof r.revision === "number") runRevision = r.revision;
     const finished = r.finished || node.terminal || !(node.options || []).length;
     const card = $("previewCard");
     if (finished) {
@@ -262,14 +267,28 @@
         </div>`;
       card.querySelectorAll("button[data-oid]").forEach((b) => {
         b.onclick = async () => {
-          b.disabled = true;
+          // Disable EVERY option of this question while the request is in
+          // flight: a second click (same or another option) must not send a
+          // parallel submission that could overwrite the path.
+          const all = [...card.querySelectorAll("button[data-oid]")];
+          const enabled = all.filter((x) => !x.disabled);
+          all.forEach((x) => { x.disabled = true; });
           try {
             const nr = await api(`/api/runs/${runId}/choice`, {
-              method: "POST", body: { option_id: b.dataset.oid } });
+              method: "POST", body: { option_id: b.dataset.oid, revision: runRevision } });
             renderRun(nr);
           } catch (err) {
-            toast(err.message);
-            b.disabled = false;
+            if (err.status === 409 && err.data?.run) {
+              // Stale page: the session moved on elsewhere (another click,
+              // another tab, undo/restart). The server left the path
+              // untouched; show the authoritative latest session so the
+              // respondent re-selects on the current question.
+              toast(err.message, 3200);
+              renderRun(err.data.run);
+            } else {
+              toast(err.message);
+              enabled.forEach((x) => { x.disabled = false; });
+            }
           }
         };
       });

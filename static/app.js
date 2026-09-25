@@ -2306,6 +2306,10 @@ async function generateInvites() {
 }
 
 let runId = null;
+// Revision of the preview session as currently rendered; sent with every
+// choice so the server can reject a stale request (409) instead of letting a
+// late/parallel submission overwrite a path that already moved on.
+let runRevision = 0;
 async function openPreview() {
   if (!state.currentId) return;
   if (state.dirty) await saveScript();
@@ -2317,6 +2321,7 @@ async function openPreview() {
 
 function renderRun(r) {
   const node = r.current_node;
+  if (typeof r.revision === "number") runRevision = r.revision;
   const card = $("#previewCard");
   if (r.finished || node.terminal || !(node.options || []).length) {
     card.innerHTML = `
@@ -2339,9 +2344,28 @@ function renderRun(r) {
       </div>`;
     card.querySelectorAll("button[data-oid]").forEach((b) => {
       b.onclick = async () => {
-        const nr = await api(`/api/runs/${runId}/choice`, {
-          method: "POST", body: { option_id: b.dataset.oid } });
-        renderRun(nr);
+        // Disable EVERY option of this question while submitting: a second
+        // click (same or another option) must not send a parallel choice
+        // that could overwrite the path or advance a cycle twice.
+        const all = [...card.querySelectorAll("button[data-oid]")];
+        const enabled = all.filter((x) => !x.disabled);
+        all.forEach((x) => { x.disabled = true; });
+        try {
+          const nr = await api(`/api/runs/${runId}/choice`, {
+            method: "POST", body: { option_id: b.dataset.oid, revision: runRevision } });
+          renderRun(nr);
+        } catch (err) {
+          if (err.status === 409 && err.data?.run) {
+            // Stale page: the session moved on elsewhere (restart, another
+            // click). The path was left untouched; show the latest session
+            // so the choice is re-made on the current question.
+            toast(err.message, 3200);
+            renderRun(err.data.run);
+          } else {
+            toast(err.message);
+            enabled.forEach((x) => { x.disabled = false; });
+          }
+        }
       };
     });
   }
