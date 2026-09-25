@@ -190,6 +190,10 @@ class InviteGenerate(BaseModel):
 
 class RunChoice(BaseModel):
     option_id: str
+    # Revision the page rendered for the current question. The server only
+    # advances the path when it still equals the session's stored revision;
+    # a late/double-clicked request carries a stale value and gets 409.
+    revision: int = 0
 
 
 class ShareResume(BaseModel):
@@ -1079,7 +1083,8 @@ def start_run(payload: RunStart):
             if not claimed:
                 # Concurrent use won the race: discard the run as well.
                 raise HTTPException(409, "邀请码刚被并发使用，本次未创建会话，请更换邀请码重试")
-    return {"run_id": run_id, "current_node": node, "steps": steps, "finished": finished}
+    return {"run_id": run_id, "current_node": node, "steps": steps,
+            "finished": finished, "revision": 0}
 
 
 def _load_run(db, run_id: int):
@@ -1089,13 +1094,39 @@ def _load_run(db, run_id: int):
     return row
 
 
+def _begin_run_write(db):
+    """Open an immediate write transaction for a run-path mutation.
+
+    Holding the write lock for the whole read-compare-update makes two
+    concurrent option requests (two tabs on one session, a click racing an
+    undo/restart) serialize: the loser sees the winner's committed state and
+    is rejected with 409 instead of overwriting the path.
+    """
+    try:
+        db.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower():
+            raise HTTPException(409, "服务繁忙，作答状态可能已更新，请按最新题目重新选择")
+        raise
+
+
+def _conflict_run(db, run_id: int) -> HTTPException:
+    """409 carrying the authoritative current session for re-rendering."""
+    return HTTPException(
+        status_code=409,
+        detail={"message": "作答状态已更新（可能是在另一页面操作或重复提交），请按最新题目重新选择",
+                "conflict": True,
+                "run": _run_response(db, _load_run(db, run_id))},
+    )
+
+
 def _run_response(db, row) -> dict[str, Any]:
     """Serialize a run row into the API shape (current node + path)."""
     content = _run_content(db, row)
     node = next((n for n in content["nodes"] if n["id"] == row["current_node_id"]), None)
     steps = json.loads(row["steps"])
     return {"run_id": row["id"], "current_node": node, "steps": steps,
-            "finished": bool(row["finished"])}
+            "finished": bool(row["finished"]), "revision": row["revision"]}
 
 
 @app.get("/api/runs/{run_id}")
@@ -1107,8 +1138,24 @@ def get_run(run_id: int):
 
 @app.post("/api/runs/{run_id}/choice")
 def choose(run_id: int, payload: RunChoice):
-    with get_db() as db:
+    """Advance the path by one option under optimistic concurrency control.
+
+    The request carries the ``revision`` the page last rendered. The compare
+    (revision + finished), the graph step and the path/revision update all run
+    in ONE ``BEGIN IMMEDIATE`` write transaction, so two requests for the same
+    session serialize on SQLite's write lock: only the first with the current
+    revision commits; every other (rapid double click on another button, a
+    second page/tab on the same session, or a request that was in flight when
+    undo/restart happened) is rejected with 409 plus the latest session and
+    leaves the path untouched. This also prevents a repeated click on the same
+    cycle option from pushing the path twice.
+    """
+    db = get_db()
+    try:
+        _begin_run_write(db)
         row = _load_run(db, run_id)
+        if row["revision"] != payload.revision:
+            raise _conflict_run(db, run_id)
         if row["finished"]:
             raise HTTPException(400, "访谈已结束，请重新开始")
         content = _run_content(db, row)
@@ -1128,9 +1175,21 @@ def choose(run_id: int, payload: RunChoice):
         steps.append({"node_id": node["id"], "title": node.get("title", ""),
                       "question": node.get("text", ""), "option_id": None, "answer": None})
         finished = bool(node.get("terminal")) or not node.get("options")
-        db.execute("UPDATE runs SET current_node_id = ?, steps = ?, finished = ? WHERE id = ?",
-                   (node["id"], json.dumps(steps, ensure_ascii=False), int(finished), run_id))
-    return {"run_id": run_id, "current_node": node, "steps": steps, "finished": finished}
+        new_revision = row["revision"] + 1
+        db.execute(
+            "UPDATE runs SET current_node_id = ?, steps = ?, finished = ?, revision = ? "
+            "WHERE id = ? AND revision = ?",
+            (node["id"], json.dumps(steps, ensure_ascii=False), int(finished),
+             new_revision, run_id, row["revision"]),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return {"run_id": run_id, "current_node": node, "steps": steps,
+            "finished": finished, "revision": new_revision}
 
 
 @app.post("/api/runs/{run_id}/undo")
@@ -1144,12 +1203,17 @@ def undo_last_choice(run_id: int):
     is rolled back — earlier passes through the node stay in the path.
 
     The current node, the path and the finished flag are updated in ONE
-    transaction, together with invalidating the session's not-yet-used resume
-    tokens (an old token must never restore a path that no longer matches).
+    transaction and the session revision is bumped, so an option request that
+    was still in flight against the pre-undo question becomes stale (409) and
+    can never re-advance the restored path. The transaction also invalidates
+    the session's not-yet-used resume tokens (an old token must never restore
+    a path that no longer matches).
     A session with zero choices is rejected; undo never creates a new session
     and never gives back an already-consumed invite code.
     """
-    with get_db() as db:
+    db = get_db()
+    try:
+        _begin_run_write(db)
         row = _load_run(db, run_id)
         steps = json.loads(row["steps"])
         # The most recent choice is the LAST step carrying an option_id;
@@ -1173,17 +1237,31 @@ def undo_last_choice(run_id: int):
         if node is None:
             raise HTTPException(400, "要返回的题目已被删除，无法撤回")
         finished = bool(node.get("terminal")) or not node.get("options")
-        db.execute("UPDATE runs SET current_node_id = ?, steps = ?, finished = ? WHERE id = ?",
-                   (back_node_id, json.dumps(steps, ensure_ascii=False), int(finished), run_id))
+        new_revision = row["revision"] + 1
+        db.execute(
+            "UPDATE runs SET current_node_id = ?, steps = ?, finished = ?, revision = ? "
+            "WHERE id = ?",
+            (back_node_id, json.dumps(steps, ensure_ascii=False), int(finished),
+             new_revision, run_id),
+        )
         # Outstanding one-time resume tokens captured the pre-undo progress;
         # void them so they cannot restore a stale path (same as restart).
         db.execute("UPDATE resume_tokens SET used = 1 WHERE run_id = ? AND used = 0", (run_id,))
-    return {"run_id": run_id, "current_node": node, "steps": steps, "finished": finished}
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return {"run_id": run_id, "current_node": node, "steps": steps,
+            "finished": finished, "revision": new_revision}
 
 
 @app.post("/api/runs/{run_id}/restart")
 def restart_run(run_id: int):
-    with get_db() as db:
+    db = get_db()
+    try:
+        _begin_run_write(db)
         row = _load_run(db, run_id)
         content = _run_content(db, row)
         try:
@@ -1194,12 +1272,26 @@ def restart_run(run_id: int):
         steps = [{"node_id": node["id"], "title": node.get("title", ""),
                   "question": node.get("text", ""), "option_id": None, "answer": None}]
         finished = bool(node.get("terminal")) or not node.get("options")
-        db.execute("UPDATE runs SET current_node_id = ?, steps = ?, finished = ? WHERE id = ?",
-                   (node["id"], json.dumps(steps, ensure_ascii=False), int(finished), run_id))
+        # Bump the revision so option requests aimed at the cleared path
+        # (a click in another tab, a request still in flight) fail with 409.
+        new_revision = row["revision"] + 1
+        db.execute(
+            "UPDATE runs SET current_node_id = ?, steps = ?, finished = ?, revision = ? "
+            "WHERE id = ?",
+            (node["id"], json.dumps(steps, ensure_ascii=False), int(finished),
+             new_revision, run_id),
+        )
         # Restart wipes the paused state: outstanding one-time tokens can no
         # longer restore a path that has been cleared.
         db.execute("UPDATE resume_tokens SET used = 1 WHERE run_id = ? AND used = 0", (run_id,))
-    return {"run_id": run_id, "current_node": node, "steps": steps, "finished": finished}
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return {"run_id": run_id, "current_node": node, "steps": steps,
+            "finished": finished, "revision": new_revision}
 
 
 @app.post("/api/runs/{run_id}/pause", status_code=201)

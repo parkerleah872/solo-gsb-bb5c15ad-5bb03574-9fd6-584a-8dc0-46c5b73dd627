@@ -114,6 +114,13 @@
 <script src="/static/common.js"></script>
 <script>
   let runId = null;
+  // Monotonic session revision last rendered. Every option request carries
+  // it; a 409 means another tab/mutation advanced the session and the
+  // response's latest session must be shown instead.
+  let runRevision = 0;
+  // True while an option request is in flight: all option buttons stay
+  // disabled, so a fast second click (same or another button) can never race.
+  let runSubmitting = false;
   let inviteOnly = false;
   // Answer-open gate state for starting a NEW session (all times UTC):
   // open | not_started (未开放, start inclusive) | closed (已截止, deadline
@@ -234,7 +241,17 @@
     el.style.display = msg ? "" : "none";
   }
 
+  // Disable every selectable option of the current question while submitting.
+  function setRunChoicesDisabled(disabled) {
+    $("previewCard").querySelectorAll("button[data-oid]").forEach((b) => {
+      if (b.dataset.unconnected === "1") return;  // permanently disabled
+      b.disabled = disabled;
+    });
+  }
+
   function renderRun(r, resumedInfo) {
+    runRevision = r.revision || 0;
+    runSubmitting = false;
     const node = r.current_node;
     const finished = r.finished || node.terminal || !(node.options || []).length;
     const card = $("previewCard");
@@ -254,7 +271,8 @@
             ${node.options.map((o) => {
               const label = trOption(node.id, o.id, o.label);
               const tip = (label !== o.label && shareLang) ? ` title="原文：${esc(o.label)}"` : "";
-              return `<button data-oid="${o.id}" ${o.target_id ? "" : "disabled"}${tip}>
+              return `<button data-oid="${o.id}" data-unconnected="${o.target_id ? "0" : "1"}"
+                      ${o.target_id ? "" : "disabled"}${tip}>
                  ${esc(label)}${o.target_id ? "" : "（未连接）"}
                </button>`;
             }).join("")}
@@ -262,14 +280,29 @@
         </div>`;
       card.querySelectorAll("button[data-oid]").forEach((b) => {
         b.onclick = async () => {
-          b.disabled = true;
+          if (runSubmitting) return;
+          // Disable ALL options of the current question for the whole
+          // request, so neither a double click nor a click on a different
+          // button can race this submission.
+          runSubmitting = true;
+          setRunChoicesDisabled(true);
           try {
             const nr = await api(`/api/runs/${runId}/choice`, {
-              method: "POST", body: { option_id: b.dataset.oid } });
+              method: "POST",
+              body: { option_id: b.dataset.oid, revision: runRevision },
+            });
             renderRun(nr);
           } catch (err) {
-            toast(err.message);
-            b.disabled = false;
+            if (err.status === 409 && err.data?.detail?.run) {
+              // Another page on this session (or undo/restart) advanced it:
+              // show the authoritative latest session for a fresh choice.
+              renderRun(err.data.detail.run);
+              toast("作答状态已更新，已显示最新题目，请重新选择");
+            } else {
+              toast(err.message);
+              runSubmitting = false;
+              setRunChoicesDisabled(false);
+            }
           }
         };
       });
@@ -406,26 +439,50 @@
     copyText($("pauseLink").value).then((ok) => toast(ok ? "续答链接已复制" : "复制失败，请手动选择复制"));
   $("pauseContinue").onclick = () => closeModal("pauseModal");
   $("runRestart").onclick = async () => {
-    if (!runId) return;
-    try {
-      $("resumeBanner").style.display = "none";
-      renderRun(await api(`/api/runs/${runId}/restart`, { method: "POST" }));
-    } catch (err) {
-      toast(err.message);
-    }
-  };
-  $("btnUndo").onclick = async () => {
-    if (!runId) return;
-    const btn = $("btnUndo");
+    if (!runId || runSubmitting) return;
+    const btn = $("runRestart");
+    runSubmitting = true;
+    setRunChoicesDisabled(true);
     btn.disabled = true;
     try {
       $("resumeBanner").style.display = "none";
-      // Server returns the same run shape; re-render refreshes both the
+      // Restart bumps the revision server-side, so any in-flight option
+      // request comes back 409 and cannot repopulate the cleared path.
+      renderRun(await api(`/api/runs/${runId}/restart`, { method: "POST" }));
+    } catch (err) {
+      if (err.status === 409 && err.data?.detail?.run) {
+        renderRun(err.data.detail.run);
+        toast("作答状态已更新，已显示最新题目，请重新选择");
+      } else {
+        toast(err.message);
+        runSubmitting = false;
+        setRunChoicesDisabled(false);
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  $("btnUndo").onclick = async () => {
+    if (!runId || runSubmitting) return;
+    const btn = $("btnUndo");
+    runSubmitting = true;
+    setRunChoicesDisabled(true);
+    btn.disabled = true;
+    try {
+      $("resumeBanner").style.display = "none";
+      // Undo bumps the revision server-side; the response re-renders both the
       // question card and the recorded answer path in one go.
       renderRun(await api(`/api/runs/${runId}/undo`, { method: "POST" }));
       toast("已撤回上一答，回到上一题");
     } catch (err) {
-      toast(err.message);
+      if (err.status === 409 && err.data?.detail?.run) {
+        renderRun(err.data.detail.run);
+        toast("作答状态已更新，已显示最新题目，请重新选择");
+      } else {
+        toast(err.message);
+        runSubmitting = false;
+        setRunChoicesDisabled(false);
+      }
     } finally {
       btn.disabled = false;
     }

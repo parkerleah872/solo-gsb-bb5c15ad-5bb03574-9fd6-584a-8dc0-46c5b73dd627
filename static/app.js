@@ -2306,16 +2306,35 @@ async function generateInvites() {
 }
 
 let runId = null;
+// Monotonic session revision last rendered in the preview. Every choice
+// request carries it; a 409 means another mutation won and the response's
+// latest session is rendered instead.
+let runRevision = 0;
+// True while an option request is in flight: all option buttons stay
+// disabled, so a fast second click (same or another button) can never race.
+let runSubmitting = false;
 async function openPreview() {
   if (!state.currentId) return;
   if (state.dirty) await saveScript();
   const r = await api("/api/runs", { method: "POST", body: { script_id: state.currentId } });
   runId = r.run_id;
+  runRevision = r.revision || 0;
+  runSubmitting = false;
   renderRun(r);
   openModal("previewModal");
 }
 
+// Disable every selectable option of the current question while submitting.
+function setRunChoicesDisabled(disabled) {
+  $("#previewCard").querySelectorAll("button[data-oid]").forEach((b) => {
+    if (b.dataset.unconnected === "1") return;  // permanently disabled
+    b.disabled = disabled;
+  });
+}
+
 function renderRun(r) {
+  runRevision = r.revision || 0;
+  runSubmitting = false;
   const node = r.current_node;
   const card = $("#previewCard");
   if (r.finished || node.terminal || !(node.options || []).length) {
@@ -2332,16 +2351,35 @@ function renderRun(r) {
         <div class="q-text">${esc(node.text)}</div>
         <div class="choices">
           ${node.options.map((o) =>
-            `<button data-oid="${o.id}" ${o.target_id ? "" : "disabled"}>
+            `<button data-oid="${o.id}" data-unconnected="${o.target_id ? "0" : "1"}"
+                    ${o.target_id ? "" : "disabled"}>
                ${esc(o.label)}${o.target_id ? "" : "（未连接，不可选）"}
              </button>`).join("")}
         </div>
       </div>`;
     card.querySelectorAll("button[data-oid]").forEach((b) => {
       b.onclick = async () => {
-        const nr = await api(`/api/runs/${runId}/choice`, {
-          method: "POST", body: { option_id: b.dataset.oid } });
-        renderRun(nr);
+        if (runSubmitting) return;
+        runSubmitting = true;
+        setRunChoicesDisabled(true);
+        try {
+          const nr = await api(`/api/runs/${runId}/choice`, {
+            method: "POST",
+            body: { option_id: b.dataset.oid, revision: runRevision },
+          });
+          renderRun(nr);
+        } catch (err) {
+          if (err.status === 409 && err.data?.detail?.run) {
+            // A concurrent/duplicate submission lost the race: render the
+            // authoritative latest session and let the user choose again.
+            renderRun(err.data.detail.run);
+            toast("作答状态已更新，已显示最新题目，请重新选择");
+          } else {
+            toast(err.message);
+            runSubmitting = false;
+            setRunChoicesDisabled(false);
+          }
+        }
       };
     });
   }
@@ -2353,9 +2391,22 @@ function renderRun(r) {
 }
 
 $("#runRestart").onclick = async () => {
-  if (!runId) return;
-  const r = await api(`/api/runs/${runId}/restart`, { method: "POST" });
-  renderRun(r);
+  if (!runId || runSubmitting) return;
+  runSubmitting = true;
+  setRunChoicesDisabled(true);
+  $("#runRestart").disabled = true;
+  try {
+    // Restart bumps the revision server-side: any in-flight option request
+    // then comes back 409 and cannot repopulate the cleared path.
+    const r = await api(`/api/runs/${runId}/restart`, { method: "POST" });
+    renderRun(r);
+  } catch (err) {
+    runSubmitting = false;
+    setRunChoicesDisabled(false);
+    toast(err.message);
+  } finally {
+    $("#runRestart").disabled = false;
+  }
 };
 
 // Closing the preview modal (✕ button, "关闭", ESC or mask click) refreshes the

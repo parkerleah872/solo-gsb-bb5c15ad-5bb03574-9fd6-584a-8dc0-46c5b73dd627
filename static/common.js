@@ -9,7 +9,14 @@ async function api(path, options = {}) {
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(typeof data.detail === "string" ? data.detail : `请求失败 (${res.status})`);
+    // Keep the HTTP status and parsed body on the error: callers need them to
+    // distinguish a 409 stale-option conflict (which carries the latest run)
+    // from ordinary validation errors.
+    const err = new Error(typeof data.detail === "string" ? data.detail
+      : (data.detail?.message || `请求失败 (${res.status})`));
+    err.status = res.status;
+    err.data = data;
+    throw err;
   }
   return data;
 }
